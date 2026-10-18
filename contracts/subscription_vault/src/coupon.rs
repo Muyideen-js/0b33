@@ -237,17 +237,19 @@ pub fn apply_coupon(
         return Err(Error::CouponExpired);
     }
 
-    if coupon.max_redemptions > 0 {
-        let count = read_redemptions(env, &code);
-        if count >= coupon.max_redemptions {
-            return Err(Error::CouponRedemptionLimitReached);
-        }
+    let observed_redemptions = read_redemptions(env, &code);
+    if coupon.max_redemptions > 0 && observed_redemptions >= coupon.max_redemptions {
+        return Err(Error::CouponRedemptionLimitReached);
     }
 
     // Token must match the subscription's settlement token.
     if coupon.token != sub.token {
         return Err(Error::CouponTokenMismatch);
     }
+
+    // Atomically claim a redemption slot (CAS against the value we validated).
+    // Done before any other write so a failure leaves no partial state.
+    cas_increment_redemptions(env, &code, observed_redemptions, coupon.max_redemptions)?;
 
     // Bind coupon to subscription.
     let sub_key = DataKey::SubCoupon(subscription_id);
@@ -256,9 +258,6 @@ pub fn apply_coupon(
 
     // Mark this (subscription_id, code) pair as redeemed.
     mark_coupon_redeemed(env, subscription_id, &code);
-
-    // Increment global redemption counter.
-    increment_redemptions(env, &code);
 
     env.events().publish(
         (Symbol::new(env, "coupon_applied"), subscription_id),
@@ -357,6 +356,30 @@ pub fn compute_discount(gross: i128, coupon: &Coupon) -> i128 {
 pub fn increment_redemptions(env: &Env, code: &Symbol) {
     let count = read_redemptions(env, code);
     write_redemptions(env, code, count.saturating_add(1));
+}
+
+/// Compare-and-swap increment of the redemption counter (Issue #388).
+///
+/// Succeeds only if the stored counter still equals `expected` (the value the
+/// caller read when validating) and the post-increment value stays within
+/// `max_redemptions` (0 = unlimited). A stale read or a full coupon yields
+/// `CouponRedemptionLimitReached`, so two interleaved binders can never both
+/// consume the last slot.
+pub fn cas_increment_redemptions(
+    env: &Env,
+    code: &Symbol,
+    expected: u32,
+    max_redemptions: u32,
+) -> Result<(), Error> {
+    let current = read_redemptions(env, code);
+    if current != expected {
+        return Err(Error::CouponRedemptionLimitReached);
+    }
+    if max_redemptions > 0 && current >= max_redemptions {
+        return Err(Error::CouponRedemptionLimitReached);
+    }
+    write_redemptions(env, code, current.saturating_add(1));
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -505,6 +528,33 @@ mod coupon_fee_ordering_tests {
 
         // The correct ordering preserves: Gross = Discount + Merchant Net + Fee
         assert_eq!(discount_correct + merchant_net_correct + fee_correct, gross);
+    }
+
+    /// CAS increment rejects stale reads and enforces the cap (Issue #388).
+    #[test]
+    fn cas_increment_rejects_stale_read_and_full_coupon() {
+        let env = Env::default();
+        let contract_id = env.register(crate::SubscriptionVault, ());
+        let code = Symbol::new(&env, "CAS");
+
+        env.as_contract(&contract_id, || {
+            // First claimer wins the only slot.
+            assert_eq!(cas_increment_redemptions(&env, &code, 0, 1), Ok(()));
+            // Second claimer holding the stale read (0) is rejected.
+            assert_eq!(
+                cas_increment_redemptions(&env, &code, 0, 1),
+                Err(Error::CouponRedemptionLimitReached)
+            );
+            // Fresh read but coupon is full: rejected.
+            assert_eq!(
+                cas_increment_redemptions(&env, &code, 1, 1),
+                Err(Error::CouponRedemptionLimitReached)
+            );
+            assert_eq!(read_redemptions(&env, &code), 1);
+            // Unlimited coupon (0) still advances with a fresh read.
+            assert_eq!(cas_increment_redemptions(&env, &code, 1, 0), Ok(()));
+            assert_eq!(read_redemptions(&env, &code), 2);
+        });
     }
 
     /// Verify the full `apply_discount_at_charge` path returns a payable that,
