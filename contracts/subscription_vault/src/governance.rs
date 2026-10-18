@@ -14,6 +14,7 @@
 use crate::types::{
     DataKey, Error, Proposal, ProposalCancelledEvent, ProposalExecutedEvent, ProposalKind,
     ProposalSubmittedEvent, ProposalVotedEvent, VoteLockedEvent, BASE_EVENT_SCHEMA_VERSION,
+    MAX_PROTOCOL_FEE_BIPS,
 };
 use soroban_sdk::{Address, Env, Map, String, Symbol, Vec};
 
@@ -102,6 +103,66 @@ fn calculate_total_weight(env: &Env) -> u32 {
     total
 }
 
+/// Validate proposal configuration for `SetProtocolFee` kind.
+///
+/// Ensures:
+/// - `target3` (fee_bps) does not exceed `MAX_PROTOCOL_FEE_BIPS`.
+/// - `target2` (treasury) is provided (not None).
+fn validate_set_protocol_fee_proposal(
+    _env: &Env,
+    fee_bps: u32,
+    treasury: &Option<Address>,
+) -> Result<(), Error> {
+    if fee_bps > MAX_PROTOCOL_FEE_BIPS {
+        return Err(Error::ProtocolFeeTooHigh);
+    }
+    if treasury.is_none() {
+        return Err(Error::InvalidInput);
+    }
+    Ok(())
+}
+
+/// Validate proposal configuration for `SetDisputeWindow` kind.
+///
+/// Ensures:
+/// - `target3` (window_secs) is not zero and fits in u32 max.
+fn validate_set_dispute_window_proposal(window_secs: u32) -> Result<(), Error> {
+    if window_secs == 0 || window_secs == u32::MAX {
+        return Err(Error::InvalidInput);
+    }
+    Ok(())
+}
+
+/// Validate proposal configuration based on its kind.
+///
+/// Pre-validates configuration that would be checked at execution time,
+/// allowing invalid proposals to be rejected at submission time to save gas.
+/// This prevents invalid proposals from being stored and voted on.
+fn validate_proposal_config(
+    env: &Env,
+    kind: ProposalKind,
+    _target: &Address,
+    target2: &Option<Address>,
+    target3: u32,
+) -> Result<(), Error> {
+    match kind {
+        ProposalKind::SetProtocolFee => {
+            validate_set_protocol_fee_proposal(env, target3, target2)?;
+        }
+        ProposalKind::SetDisputeWindow => {
+            validate_set_dispute_window_proposal(target3)?;
+        }
+        // Other proposal kinds have no pre-validation requirements
+        ProposalKind::RotateAdmin
+        | ProposalKind::UpgradeContract
+        | ProposalKind::EmergencyStop
+        | ProposalKind::RecoverStrandedFunds
+        | ProposalKind::AddAcceptedToken
+        | ProposalKind::RemoveAcceptedToken => {}
+    }
+    Ok(())
+}
+
 /// Submit a new governance proposal.
 ///
 /// Creates a proposal with a deterministic ID and stores it in persistent storage.
@@ -127,6 +188,9 @@ pub fn do_submit_proposal(
     if kind == ProposalKind::SetDisputeWindow && target3 == 0 {
         return Err(Error::InvalidInput);
     }
+
+    // Pre-validate proposal configuration based on kind
+    validate_proposal_config(env, kind, &target, &target2, target3)?;
 
     let now = env.ledger().timestamp();
     let min_eta = now.checked_add(MIN_TIMELOCK_DELAY).ok_or(Error::Overflow)?;
